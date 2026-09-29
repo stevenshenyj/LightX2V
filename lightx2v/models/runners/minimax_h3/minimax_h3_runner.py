@@ -586,7 +586,29 @@ class MiniMaxH3Runner(DefaultRunner):
                 with ProfilingContext4DebugL1("step_pre"):
                     self.scheduler.step_pre(step_index)
                 with ProfilingContext4DebugL1("🚀 infer_main"):
-                    self.model.infer(self.inputs)
+                    import os as _os, torch as _torch
+                    _pp = _os.environ.get("LIGHTX2V_H3_PROFILE_TRACE", "")
+                    if _pp and step_index == 0:
+                        from torch.profiler import profile as _profile, ProfilerActivity as _PA
+                        _mode = _os.environ.get("LIGHTX2V_H3_PROFILE_ACT", "cpu")
+                        _acts = [_PA.CPU]
+                        if _mode in ("cuda","both") and _torch.cuda.is_available(): _acts.append(_PA.CUDA)
+                        _rs = _os.environ.get("LIGHTX2V_H3_PROFILE_SHAPES","0")=="1"
+                        with _profile(activities=_acts, record_shapes=_rs) as _pf:
+                            self.model.infer(self.inputs)
+                            if _torch.cuda.is_available():
+                                _torch.cuda.synchronize()
+                        _rk = int(_os.environ.get("RANK", "0"))
+                        _o = (_pp[:-5] if _pp.endswith(".json") else _pp) + f".rank{_rk}.json"
+                        _os.makedirs(_os.path.dirname(_o) or ".", exist_ok=True)
+                        _pf.export_chrome_trace(_o)
+                        try:
+                            open(_o[:-5] + ".table.txt", "w").write(_pf.key_averages().table(sort_by="self_cuda_time_total", row_limit=50))
+                        except Exception as _e:
+                            logger.info(f"[profile] table fail: {_e}")
+                        logger.info(f"[profile] trace -> {_o}")
+                    else:
+                        self.model.infer(self.inputs)
                 with ProfilingContext4DebugL1("step_post"):
                     self.scheduler.step_post()
                 if self.progress_callback:

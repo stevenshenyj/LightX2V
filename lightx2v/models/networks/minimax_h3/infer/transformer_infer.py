@@ -48,6 +48,13 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         if self.qkv_norm_rope_type not in QKV_NORM_ROPE_REGISTER:
             raise ValueError(f"Unsupported qkv_norm_rope_type: {self.qkv_norm_rope_type}")
         self.qkv_norm_rope = QKV_NORM_ROPE_REGISTER[self.qkv_norm_rope_type]()
+        self.fused_adaln = None
+        if config.get("use_aiter_fused_adaln", False):
+            # Explicitly enabled: fail at init rather than silently keeping the unfused chain.
+            from aiter.ops.triton.fusions.fused_rmsnorm_indexed_adaln import fused_rmsnorm_indexed_adaln
+
+            self.fused_adaln = fused_rmsnorm_indexed_adaln
+            logger.info("MiniMax-H3 DiT AdaLN uses AITER fused_rmsnorm_indexed_adaln (use_aiter_fused_adaln=true)")
         if config.get("seq_parallel", False):
             self.seq_p_group = config["device_mesh"].get_group(mesh_dim="seq_p")
             parallel = config.get("parallel", {})
@@ -168,6 +175,9 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         value, gate = weights.in_proj.apply(hidden_states).chunk(2, dim=-1)
         return weights.out_proj.apply(value * F.silu(gate))
 
+    def _fused_adaln_apply(self, norm, hidden_states, shift, scale, indices):
+        return self.fused_adaln(hidden_states, norm._get_actual_weight(), shift, scale, indices, eps=norm.eps, round_intermediate=True)
+
     def infer_block(self, weights, hidden_states, pre_infer_out, modulation=None):
         # Keep the Python cache lookup outside the compiled block.
         if modulation is None:
@@ -176,15 +186,21 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         indices = pre_infer_out.adaln_indices
 
         residual = hidden_states
-        normed = weights.norm1.apply(hidden_states)
-        normed = normed * (1.0 + scale_msa.index_select(0, indices))
-        normed = normed + shift_msa.index_select(0, indices)
+        if self.fused_adaln is not None:
+            normed = self._fused_adaln_apply(weights.norm1, hidden_states, shift_msa, scale_msa, indices)
+        else:
+            normed = weights.norm1.apply(hidden_states)
+            normed = normed * (1.0 + scale_msa.index_select(0, indices))
+            normed = normed + shift_msa.index_select(0, indices)
         hidden_states = residual + gate_msa.index_select(0, indices) * self._attention(weights.attn, normed, pre_infer_out)
 
         residual = hidden_states
-        normed = weights.norm2.apply(hidden_states)
-        normed = normed * (1.0 + scale_mlp.index_select(0, indices))
-        normed = normed + shift_mlp.index_select(0, indices)
+        if self.fused_adaln is not None:
+            normed = self._fused_adaln_apply(weights.norm2, hidden_states, shift_mlp, scale_mlp, indices)
+        else:
+            normed = weights.norm2.apply(hidden_states)
+            normed = normed * (1.0 + scale_mlp.index_select(0, indices))
+            normed = normed + shift_mlp.index_select(0, indices)
         hidden_states = residual + gate_mlp.index_select(0, indices) * self._ff(weights.ff, normed)
         return hidden_states
 
