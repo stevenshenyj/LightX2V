@@ -1,3 +1,5 @@
+import os
+
 import torch
 from loguru import logger
 
@@ -7,6 +9,11 @@ except ImportError:
     magi_register_custom_op = None
 
 from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
+
+try:
+    from sageattention.core import sageattn_qk_int8_pv_fp8_gfx12_prepacked
+except Exception:
+    sageattn_qk_int8_pv_fp8_gfx12_prepacked = None
 
 from .template import AttnWeightTemplate
 from .utils.sla_util import get_block_map, get_cuda_arch
@@ -87,6 +94,18 @@ class SageAttn2Weight(AttnWeightTemplate):
         max_seqlen_kv=None,
         **kwargs,
     ):
+        if getattr(q, "is_h3_fused_sage_prepare", False):
+            if sageattn_qk_int8_pv_fp8_gfx12_prepacked is None:
+                raise ImportError("sageattention prepacked gfx12 API is unavailable")
+            bs = 1
+            if max_seqlen_q is None:
+                max_seqlen_q = q.seq_len
+            out = sageattn_qk_int8_pv_fp8_gfx12_prepacked(
+                q.q_int8, q.k_int8, q.value_native, q.q_scale, q.k_scale, q.value_scale,
+                tensor_layout="NHD", is_causal=False, kv_len=q.seq_len, out_dtype=q.dtype, use_mixed_key_hnd=True,
+                impl=os.environ.get("H3_SEPARATE_FUSED_SAGE_IMPL", "h3_int8q"),
+            )[:, :max_seqlen_q]
+            return out.reshape(bs * max_seqlen_q, -1)
         q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
         if len(q.shape) == 3:
             bs = 1

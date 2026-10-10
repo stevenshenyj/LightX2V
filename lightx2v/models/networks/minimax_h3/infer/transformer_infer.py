@@ -1,4 +1,5 @@
 from functools import cache
+import os
 
 import torch
 import torch.distributed as dist
@@ -9,6 +10,7 @@ from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerI
 from lightx2v.models.networks.minimax_h3.adaln_cache import load_persistent_adaln_cache
 from lightx2v.models.networks.minimax_h3.infer import fused_qkv  # noqa: F401 - registers the Triton backend
 from lightx2v.models.networks.minimax_h3.infer import coresw_ffn_experiment
+from lightx2v.models.networks.minimax_h3.infer import fused_sage_prepare_separate
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.registry_factory import QKV_NORM_ROPE_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -98,6 +100,19 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             q = weights.to_q.apply(hidden_states)
             k = weights.to_k.apply(hidden_states)
             v = weights.to_v.apply(hidden_states)
+
+        if os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE", "0") == "1":
+            try:
+                k_block_s = int(os.environ.get("H3_SEPARATE_FUSED_K_BLOCK_S", "128"))
+                v_block_s = int(os.environ.get("H3_SEPARATE_FUSED_V_BLOCK_S", "256"))
+                return fused_sage_prepare_separate.separate_fused_sage_prepare(
+                    q, k, v, weights.norm_q, weights.norm_k, rotary_emb,
+                    num_heads=self.num_heads, head_dim=self.head_dim, k_block_s=k_block_s, v_block_s=v_block_s,
+                ), None, None
+            except Exception as exc:
+                if os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE_STRICT", "0") == "1":
+                    raise
+                logger.warning("H3_SEPARATE_FUSED_SAGE_PREPARE failed; falling back to normal QKV prepare: {}", exc)
 
         if self.use_fused_qkv_norm_rope:
             fused = self.qkv_norm_rope.apply(
