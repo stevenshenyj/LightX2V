@@ -76,7 +76,10 @@ class _PatchEmbed(nn.Module):
 
     def forward(self, pixels):
         pixels = pixels.view(-1, self.in_channels, self.temporal_patch_size, self.patch_size, self.patch_size)
-        return self.proj(pixels.to(self.proj.weight.dtype)).view(-1, self.proj.out_channels)
+        # gfx1201: PLATFORM=amd_rocm disables cudnn globally (fast VAE decode) but that makes this
+        # 3D-conv patch-embed ~34s; scope cudnn back on here only (~0.5ms). See worklog §11.12.
+        with torch.backends.cudnn.flags(enabled=True):
+            return self.proj(pixels.to(self.proj.weight.dtype)).view(-1, self.proj.out_channels)
 
 
 class _VisionAttention(nn.Module):

@@ -594,7 +594,8 @@ class MiniMaxH3Runner(DefaultRunner):
                         _acts = [_PA.CPU]
                         if _mode in ("cuda","both") and _torch.cuda.is_available(): _acts.append(_PA.CUDA)
                         _rs = _os.environ.get("LIGHTX2V_H3_PROFILE_SHAPES","0")=="1"
-                        with _profile(activities=_acts, record_shapes=_rs) as _pf:
+                        _ws = _os.environ.get("LIGHTX2V_H3_PROFILE_STACK","0")=="1"
+                        with _profile(activities=_acts, record_shapes=_rs, with_stack=_ws) as _pf:
                             self.model.infer(self.inputs)
                             if _torch.cuda.is_available():
                                 _torch.cuda.synchronize()
@@ -741,3 +742,5 @@ class MiniMaxH3Runner(DefaultRunner):
                 # the runner should not retain another request-sized result.
                 self.gen_video = None
                 self.gen_audio = None
+
+
