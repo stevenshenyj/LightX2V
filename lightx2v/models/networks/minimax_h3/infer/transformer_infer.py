@@ -8,6 +8,7 @@ from loguru import logger
 from lightx2v.common.transformer_infer.transformer_infer import BaseTransformerInfer
 from lightx2v.models.networks.minimax_h3.adaln_cache import load_persistent_adaln_cache
 from lightx2v.models.networks.minimax_h3.infer import fused_qkv  # noqa: F401 - registers the Triton backend
+from lightx2v.models.networks.minimax_h3.infer import coresw_ffn_experiment
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.registry_factory import QKV_NORM_ROPE_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
@@ -168,7 +169,19 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             )
             if aux_out is not None:
                 out = torch.cat((aux_out, out), dim=0)
-        return weights.to_out.apply(out.to(self.infer_dtype))
+        out = out.to(self.infer_dtype)
+        projected = coresw_ffn_experiment.attention_out_projection(self, weights.to_out, out)
+        if projected is not None:
+            return projected
+        return weights.to_out.apply(out)
+
+    def _ff_residual(self, weights, hidden_states, residual, gate, indices):
+        fused = coresw_ffn_experiment.feed_forward_residual(self, weights, hidden_states, residual, gate, indices)
+        if fused is not None:
+            return fused
+        value, activation_gate = weights.in_proj.apply(hidden_states).chunk(2, dim=-1)
+        projected = weights.out_proj.apply(value * F.silu(activation_gate))
+        return residual + gate.index_select(0, indices) * projected
 
     @staticmethod
     def _ff(weights, hidden_states):
@@ -201,7 +214,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             normed = weights.norm2.apply(hidden_states)
             normed = normed * (1.0 + scale_mlp.index_select(0, indices))
             normed = normed + shift_mlp.index_select(0, indices)
-        hidden_states = residual + gate_mlp.index_select(0, indices) * self._ff(weights.ff, normed)
+        hidden_states = self._ff_residual(weights.ff, normed, residual, gate_mlp, indices)
         return hidden_states
 
     def _compute_adaln_table(self, weights, pre_infer_out):
