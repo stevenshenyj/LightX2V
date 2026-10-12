@@ -91,9 +91,19 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         return torch.cat(gathered, dim=-1)
 
     def _attention_routes_int4(self, weights, q):
-        # sage_attn2_int4 blocks quantize bf16 Q/K/V themselves, so they skip the int8 fused sage prepare.
+        # sage_attn2_int4 blocks quantize Q/K/V themselves, so they skip the int8 fused sage prepare.
         routes_int4 = getattr(weights.calculate, "routes_int4", None)
         return routes_int4 is not None and routes_int4(self.block_idx, q.shape[0], q.device)
+
+    def _int4_fused_prepare(self, weights, q, k, v, rotary_emb):
+        # sage_int4 >= 0.1.3 fuses the Triton qkv_norm_rope math into its int4 prepare (no bf16 Q/K/V round trip).
+        prepare = getattr(weights.calculate, "prepare_norm_rope", None)
+        if prepare is None or self.seq_p_group is not None or not self.use_fused_qkv_norm_rope or self.qkv_norm_rope_type != "triton":
+            return None
+        freqs = fused_qkv.prepare_qkv_norm_rope(q, k, v, weights.norm_q, weights.norm_k, weights.rope, rotary_emb)
+        if freqs is None:
+            return None
+        return prepare(q, k, v, weights.norm_q.weight, weights.norm_k.weight, *freqs, weights.norm_q.eps, weights.norm_k.eps)
 
     def _prepare_qkv(self, weights, hidden_states, rotary_emb):
         """Project QKV and return Q/K with normalization and RoPE applied."""
@@ -106,7 +116,11 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             k = weights.to_k.apply(hidden_states)
             v = weights.to_v.apply(hidden_states)
 
-        if os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE", "0") == "1" and not self._attention_routes_int4(weights, q):
+        if self._attention_routes_int4(weights, q):
+            prepared = self._int4_fused_prepare(weights, q, k, v, rotary_emb)
+            if prepared is not None:
+                return prepared, None, None
+        elif os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE", "0") == "1":
             try:
                 k_block_s = int(os.environ.get("H3_SEPARATE_FUSED_K_BLOCK_S", "128"))
                 v_block_s = int(os.environ.get("H3_SEPARATE_FUSED_V_BLOCK_S", "256"))
