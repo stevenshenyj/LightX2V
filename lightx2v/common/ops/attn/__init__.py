@@ -21,3 +21,10 @@ from .svg_attn import SvgAttnWeight
 from .torch_sdpa import TorchSDPAWeight
 from .ulysses_attn import UlyssesAttnWeight
 from .amd_rocm import AiterSageAttnWeight
+
+# Optional INT4-QK backend from the sage_int4 package (registers "sage_attn2_int4").
+try:
+    import sage_int4.lightx2v_backend  # noqa: F401,E402
+except ImportError as _e:
+    if _e.name != "sage_int4":
+        print(f"[lightx2v] sage_int4 is installed but unusable: {_e!r}")

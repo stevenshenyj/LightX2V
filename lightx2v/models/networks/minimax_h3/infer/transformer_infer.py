@@ -90,6 +90,11 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         dist.all_gather(gathered, tensor.contiguous(), group=self.tp_group)
         return torch.cat(gathered, dim=-1)
 
+    def _attention_routes_int4(self, weights, q):
+        # sage_attn2_int4 blocks quantize bf16 Q/K/V themselves, so they skip the int8 fused sage prepare.
+        routes_int4 = getattr(weights.calculate, "routes_int4", None)
+        return routes_int4 is not None and routes_int4(self.block_idx, q.shape[0], q.device)
+
     def _prepare_qkv(self, weights, hidden_states, rotary_emb):
         """Project QKV and return Q/K with normalization and RoPE applied."""
         if self.use_fused_qkv and weights.has_fused_qkv:
@@ -101,7 +106,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             k = weights.to_k.apply(hidden_states)
             v = weights.to_v.apply(hidden_states)
 
-        if os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE", "0") == "1":
+        if os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE", "0") == "1" and not self._attention_routes_int4(weights, q):
             try:
                 k_block_s = int(os.environ.get("H3_SEPARATE_FUSED_K_BLOCK_S", "128"))
                 v_block_s = int(os.environ.get("H3_SEPARATE_FUSED_V_BLOCK_S", "256"))
