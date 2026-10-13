@@ -20,7 +20,7 @@ from .svg2_attn import Svg2AttnWeight
 from .svg_attn import SvgAttnWeight
 from .torch_sdpa import TorchSDPAWeight
 from .ulysses_attn import UlyssesAttnWeight
-from .amd_rocm import AiterSageAttnWeight
+from .amd_rocm import AiterSageAttnWeight, SageAttn2Int8ExactWeight
 
 # Optional INT4-QK backend from the sage_int4 package (registers "sage_attn2_int4").
 try:

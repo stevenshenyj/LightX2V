@@ -35,6 +35,7 @@ class H3SeparateFusedSagePackedQKV:
     num_heads: int
     head_dim: int
     dtype: torch.dtype
+    lane_major_kv: bool = False
 
     @property
     def device(self):
@@ -241,7 +242,7 @@ def _view_3d(x: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
 
 
 def separate_fused_sage_prepare(q_2d, k_2d, v_2d, norm_q, norm_k, rotary_emb, *, num_heads: int, head_dim: int,
-                                k_block_s: int = 128, v_block_s: int = 256):
+                                k_block_s: int = 128, v_block_s: int = 256, lane_major_kv: bool | None = None):
     """Return prepacked int8-Q/int8-K/fp8-V tensors for the fast int8-Q native attention."""
     q = _view_3d(q_2d, num_heads, head_dim)
     k = _view_3d(k_2d, num_heads, head_dim)
@@ -255,10 +256,11 @@ def separate_fused_sage_prepare(q_2d, k_2d, v_2d, norm_q, norm_k, rotary_emb, *,
     kw = norm_k.weight.contiguous()
     # h3_int8q_permute core requires LaneMajorKv/SwapHalfPermute K/V layout.
     # Keep explicit env override, and auto-enable it when the prepacked Sage impl selects permute.
-    lane_major_kv = (
-        os.environ.get("H3_SEPARATE_FUSED_LANE_MAJOR_KV", "0") == "1"
-        or os.environ.get("H3_SEPARATE_FUSED_SAGE_IMPL", "h3_int8q") == "h3_int8q_permute"
-    )
+    if lane_major_kv is None:
+        lane_major_kv = (
+            os.environ.get("H3_SEPARATE_FUSED_LANE_MAJOR_KV", "0") == "1"
+            or os.environ.get("H3_SEPARATE_FUSED_SAGE_IMPL", "h3_int8q") == "h3_int8q_permute"
+        )
 
     q_i8 = torch.empty((1, S, H, D), device=q.device, dtype=torch.int8)
     q_scale = torch.empty((1, H, math.ceil(S / Q_GROUP)), device=q.device, dtype=torch.float32)
@@ -286,4 +288,5 @@ def separate_fused_sage_prepare(q_2d, k_2d, v_2d, norm_q, norm_k, rotary_emb, *,
     v_fp8 = torch.empty((1, H, D, pad), device=q.device, dtype=torch.uint8)
     _v_quant_hds[(math.ceil(pad / V_GROUP), H)](v, vscale, v_fp8, S, pad, H, D, BLOCK_S=V_GROUP, BLOCK_D=128, LaneMajorKV=lane_major_kv, num_warps=8)
 
-    return H3SeparateFusedSagePackedQKV(q_i8, q_scale, k_i8, k_scale, v_fp8, vscale.unsqueeze(0).contiguous(), S, H, D, q_2d.dtype)
+    return H3SeparateFusedSagePackedQKV(q_i8, q_scale, k_i8, k_scale, v_fp8, vscale.unsqueeze(0).contiguous(), S, H, D, q_2d.dtype,
+                                        lane_major_kv)

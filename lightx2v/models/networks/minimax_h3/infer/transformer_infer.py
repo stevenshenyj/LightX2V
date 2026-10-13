@@ -116,20 +116,23 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             k = weights.to_k.apply(hidden_states)
             v = weights.to_v.apply(hidden_states)
 
+        # Backends that only take the prepacked lane-major layout (sage_attn2_int8_exact) always use the fused prepare.
+        needs_prepack = getattr(weights.calculate, "requires_h3_lane_major_prepack", False)
         if self._attention_routes_int4(weights, q):
             prepared = self._int4_fused_prepare(weights, q, k, v, rotary_emb)
             if prepared is not None:
                 return prepared, None, None
-        elif os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE", "0") == "1":
+        elif needs_prepack or os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE", "0") == "1":
             try:
                 k_block_s = int(os.environ.get("H3_SEPARATE_FUSED_K_BLOCK_S", "128"))
                 v_block_s = int(os.environ.get("H3_SEPARATE_FUSED_V_BLOCK_S", "256"))
                 return fused_sage_prepare_separate.separate_fused_sage_prepare(
                     q, k, v, weights.norm_q, weights.norm_k, rotary_emb,
                     num_heads=self.num_heads, head_dim=self.head_dim, k_block_s=k_block_s, v_block_s=v_block_s,
+                    lane_major_kv=True if needs_prepack else None,
                 ), None, None
             except Exception as exc:
-                if os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE_STRICT", "0") == "1":
+                if needs_prepack or os.environ.get("H3_SEPARATE_FUSED_SAGE_PREPARE_STRICT", "0") == "1":
                     raise
                 logger.warning("H3_SEPARATE_FUSED_SAGE_PREPARE failed; falling back to normal QKV prepare: {}", exc)
 
