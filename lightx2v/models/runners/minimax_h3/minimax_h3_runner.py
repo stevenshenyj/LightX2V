@@ -1,4 +1,5 @@
 import os
+import sys
 from contextlib import suppress
 
 import numpy as np
@@ -588,7 +589,7 @@ class MiniMaxH3Runner(DefaultRunner):
                 with ProfilingContext4DebugL1("🚀 infer_main"):
                     import os as _os, torch as _torch
                     _pp = _os.environ.get("LIGHTX2V_H3_PROFILE_TRACE", "")
-                    if _pp and step_index == 0:
+                    if _pp and step_index + 1 == int(_os.environ.get("LIGHTX2V_H3_PROFILE_STEP", "1")):
                         from torch.profiler import profile as _profile, ProfilerActivity as _PA
                         _mode = _os.environ.get("LIGHTX2V_H3_PROFILE_ACT", "cpu")
                         _acts = [_PA.CPU]
@@ -614,6 +615,15 @@ class MiniMaxH3Runner(DefaultRunner):
                     self.scheduler.step_post()
                 if self.progress_callback:
                     self.progress_callback(((step_index + 1) / infer_steps) * 100, 100)
+            if step_index + 1 == int(os.environ.get("LIGHTX2V_H3_EXIT_AFTER_STEP", "0")):
+                # Diagnostic runs stop after the profiled steps; skip VAE decode and teardown.
+                torch_device_module.synchronize()
+                if dist.is_initialized():
+                    dist.barrier()
+                logger.info(f"[profile] LIGHTX2V_H3_EXIT_AFTER_STEP={step_index + 1}: exiting")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                os._exit(0)
         return self.scheduler.video_latents, self.scheduler.audio_latents
 
     @ProfilingContext4DebugL2("Offload DiT")

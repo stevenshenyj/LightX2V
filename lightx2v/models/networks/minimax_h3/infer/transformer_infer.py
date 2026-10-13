@@ -1,4 +1,5 @@
 from functools import cache
+import json
 import os
 
 import torch
@@ -14,6 +15,12 @@ from lightx2v.models.networks.minimax_h3.infer import fused_sage_prepare_separat
 from lightx2v.utils.envs import GET_DTYPE
 from lightx2v.utils.registry_factory import QKV_NORM_ROPE_REGISTER
 from lightx2v_platform.base.global_var import AI_DEVICE
+
+# 1-based DiT steps whose blocks get per-phase GPU event timings (diagnostic, default off).
+_PROBE_STEPS = frozenset(int(s) for s in os.environ.get("LIGHTX2V_H3_PROBE_STEPS", "").split(",") if s.strip())
+# Dump the packed attention inputs of these 1-based steps / blocks to LIGHTX2V_H3_CAPTURE_DIR (diagnostic, default off).
+_CAPTURE_STEPS = frozenset(int(s) for s in os.environ.get("LIGHTX2V_H3_CAPTURE_STEPS", "").split(",") if s.strip())
+_CAPTURE_BLOCKS = frozenset(int(s) for s in os.environ.get("LIGHTX2V_H3_CAPTURE_BLOCKS", "").split(",") if s.strip())
 
 
 @cache
@@ -71,6 +78,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         else:
             self.seq_p_group = None
         self.infer_func = self.infer_without_offload
+        self._probe_marks = None
         self.use_adaln_cache = bool(config.get("use_adaln_cache", False))
         self._current_adaln_tables = None
         self._adaln_cache_hit = False
@@ -82,6 +90,53 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
     def _cache_device():
         device_module = getattr(torch, AI_DEVICE)
         return torch.device(AI_DEVICE, device_module.current_device())
+
+    def _probe(self, phase):
+        """Record the end of `phase` on the current stream when the step is probed."""
+        if self._probe_marks is not None:
+            event = getattr(torch, AI_DEVICE).Event(enable_timing=True)
+            event.record()
+            self._probe_marks.append((self.block_idx, phase, event))
+
+    def _dump_probe(self, step, marks):
+        getattr(torch, AI_DEVICE).synchronize()
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        blocks, totals, last = [], {}, None
+        for block_idx, phase, event in marks:
+            if phase == "gap":
+                blocks.append({"block": block_idx})
+            ms = last.elapsed_time(event) if last is not None else 0.0
+            blocks[-1][phase] = ms
+            totals[phase] = totals.get(phase, 0.0) + ms
+            last = event
+        record = {
+            "step": step,
+            "rank": rank,
+            "attn_type": self.config.get("attn_type"),
+            "wall_ms": marks[0][2].elapsed_time(marks[-1][2]),
+            "totals_ms": totals,
+            "blocks": blocks,
+        }
+        logger.info("[probe] step {} rank {} wall {:.1f} ms | {}", step, rank, record["wall_ms"], " ".join(f"{k}={v:.1f}" for k, v in totals.items()))
+        probe_dir = os.environ.get("LIGHTX2V_H3_PROBE_DIR", "")
+        if probe_dir:
+            os.makedirs(probe_dir, exist_ok=True)
+            with open(os.path.join(probe_dir, f"probe_step{step}.rank{rank}.json"), "w") as f:
+                json.dump(record, f, indent=1)
+
+    def _capture_packed(self, packed):
+        if not getattr(packed, "is_h3_fused_sage_prepare", False):
+            raise RuntimeError("LIGHTX2V_H3_CAPTURE_* needs the H3 fused sage prepare path")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        step = self.scheduler.step_index + 1
+        names = ("q_int8", "q_scale", "k_int8", "k_scale", "value_native", "value_scale")
+        record = {n: getattr(packed, n).cpu() for n in names}
+        record.update(seq_len=packed.seq_len, lane_major_kv=packed.lane_major_kv, step=step, block=self.block_idx, rank=rank)
+        out_dir = os.environ["LIGHTX2V_H3_CAPTURE_DIR"]
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, f"packed_step{step}_block{self.block_idx}_rank{rank}.pt")
+        torch.save(record, path)
+        logger.info("[capture] {}", path)
 
     def _gather_tp_last_dim(self, tensor):
         if self.tp_size == 1:
@@ -115,6 +170,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             q = weights.to_q.apply(hidden_states)
             k = weights.to_k.apply(hidden_states)
             v = weights.to_v.apply(hidden_states)
+        self._probe("qkv_gemm")
 
         # Backends that only take the prepacked lane-major layout (sage_attn2_int8_exact) always use the fused prepare.
         needs_prepack = getattr(weights.calculate, "requires_h3_lane_major_prepack", False)
@@ -166,6 +222,9 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
 
     def _attention(self, weights, hidden_states, pre_infer_out):
         q, k, v = self._prepare_qkv(weights, hidden_states, pre_infer_out.rotary_emb)
+        self._probe("prepare")
+        if self.block_idx in _CAPTURE_BLOCKS and self.scheduler.step_index + 1 in _CAPTURE_STEPS:
+            self._capture_packed(q)
         sp_state = pre_infer_out.sequence_parallel_state
         attention_kwargs = {
             "causal": False,
@@ -206,6 +265,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             )
             if aux_out is not None:
                 out = torch.cat((aux_out, out), dim=0)
+        self._probe("core")
         out = out.to(self.infer_dtype)
         projected = coresw_ffn_experiment.attention_out_projection(self, weights.to_out, out)
         if projected is not None:
@@ -234,6 +294,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             modulation = self._compute_adaln_table(weights, pre_infer_out)
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = modulation.chunk(6, dim=-1)
         indices = pre_infer_out.adaln_indices
+        self._probe("gap")
 
         residual = hidden_states
         if self.fused_adaln is not None:
@@ -242,7 +303,10 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             normed = weights.norm1.apply(hidden_states)
             normed = normed * (1.0 + scale_msa.index_select(0, indices))
             normed = normed + shift_msa.index_select(0, indices)
-        hidden_states = residual + gate_msa.index_select(0, indices) * self._attention(weights.attn, normed, pre_infer_out)
+        self._probe("adaln1")
+        attn_out = self._attention(weights.attn, normed, pre_infer_out)
+        self._probe("out_proj")
+        hidden_states = residual + gate_msa.index_select(0, indices) * attn_out
 
         residual = hidden_states
         if self.fused_adaln is not None:
@@ -251,7 +315,9 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
             normed = weights.norm2.apply(hidden_states)
             normed = normed * (1.0 + scale_mlp.index_select(0, indices))
             normed = normed + shift_mlp.index_select(0, indices)
+        self._probe("adaln2")
         hidden_states = self._ff_residual(weights.ff, normed, residual, gate_mlp, indices)
+        self._probe("ffn")
         return hidden_states
 
     def _compute_adaln_table(self, weights, pre_infer_out):
@@ -303,4 +369,13 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
     def infer(self, block_weights, pre_infer_out):
         if self.use_adaln_cache:
             self._prepare_adaln_cache(pre_infer_out)
-        return self.infer_func(block_weights.blocks, pre_infer_out.hidden_states, pre_infer_out)
+        step = self.scheduler.step_index + 1
+        if step not in _PROBE_STEPS:
+            return self.infer_func(block_weights.blocks, pre_infer_out.hidden_states, pre_infer_out)
+        self._probe_marks = []
+        try:
+            hidden_states = self.infer_func(block_weights.blocks, pre_infer_out.hidden_states, pre_infer_out)
+        finally:
+            marks, self._probe_marks = self._probe_marks, None
+        self._dump_probe(step, marks)
+        return hidden_states
