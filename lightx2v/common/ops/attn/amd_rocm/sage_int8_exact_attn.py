@@ -1,7 +1,7 @@
 # gfx1201 SageAttention core: INT8 QK + FP8 PV WMMA with exact exp2 P.
 # Kernel source in ./sage_int8_exact is copied unmodified from
-# /app/sageattn_best_dualprob_no_precision_reg_20261013/src and built with that package's flags
-# (common.build_port): output is bitwise equal to the dualprob core built with APPROX_FP8_P=0.
+# /app/sageattn_best_dualprob_no_precision_reg_20261013/src (attn_int8_port.cu there, attn_int8_qk_opt.cu here) and built
+# with that package's flags (common.build_port): output is bitwise equal to the dualprob core built with APPROX_FP8_P=0.
 import hashlib
 import os
 from pathlib import Path
@@ -14,9 +14,9 @@ from lightx2v.utils.registry_factory import ATTN_WEIGHT_REGISTER
 from ..template import AttnWeightTemplate
 
 _SOURCE_DIR = Path(__file__).resolve().parent / "sage_int8_exact"
-_SOURCE = _SOURCE_DIR / "attn_int8_port.cu"
+_SOURCE = _SOURCE_DIR / "attn_int8_qk_opt.cu"
 _SOURCE_SHA256 = {
-    "attn_int8_port.cu": "b171039eb1940b857aae84fe1c8494f9de20b47d614fcd7ca52374392d793463",
+    "attn_int8_qk_opt.cu": "b171039eb1940b857aae84fe1c8494f9de20b47d614fcd7ca52374392d793463",
     "softmax_asm.inc": "909f19d5c929a5f499dc421e66c2e8ead74c6313b0599ee9a4a7c0190dd564a9",
     "rowmax_asm.inc": "b9ec8f7dee4d4ce7f57e62015bd7d0e8e8fef4f829efc98962b11121ee223ee1",
 }
