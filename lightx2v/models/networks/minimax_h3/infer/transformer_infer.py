@@ -151,7 +151,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         return routes_int4 is not None and routes_int4(self.block_idx, q.shape[0], q.device)
 
     def _int4_fused_prepare(self, weights, q, k, v, rotary_emb):
-        # sage_int4 >= 0.1.3 fuses the Triton qkv_norm_rope math into its int4 prepare (no bf16 Q/K/V round trip).
+        # sage_attn2_int4 fuses the Triton qkv_norm_rope math into its int4 prepare (no bf16 Q/K/V round trip).
         prepare = getattr(weights.calculate, "prepare_norm_rope", None)
         if prepare is None or self.seq_p_group is not None or not self.use_fused_qkv_norm_rope or self.qkv_norm_rope_type != "triton":
             return None
@@ -173,7 +173,7 @@ class MiniMaxH3TransformerInfer(BaseTransformerInfer):
         self._probe("qkv_gemm")
 
         # Backends that only take the prepacked lane-major layout (sage_attn2_int8_exact) always use the fused prepare.
-        # sage_attn2_int4 >= 0.1.4 asks for it on the calls it does not run in int4 (its int8 core for blocks 45/49)
+        # sage_attn2_int4 asks for it on the calls it does not run in int4 (its int8 core for blocks 45/49)
         # and falls back to BF16 Q/K/V (sage_attn2) if the prepare fails; the prepacked layout cannot be sequence-split.
         needs_prepack = getattr(weights.calculate, "requires_h3_lane_major_prepack", False)
         wants_prepack = needs_prepack or (
